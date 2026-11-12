@@ -1,0 +1,11 @@
+.git/**
+node_modules/**
+tests/**
+docs/**
+*.vsix
+**/__pycache__/**
+**/*.pyc
+.vscodeignore
+.gitignore
+outputs/**
+**/*.code-workspace

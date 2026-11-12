@@ -1,0 +1,83 @@
+{
+  "name": "serial-bridge",
+  "displayName": "串口与探针映射 · Mac ↔ SSH",
+  "description": "多路本机串口与 CMSIS-DAP 探针，经 SSH 映射到远端工作区，独立控制并提供实时串口日志。",
+  "version": "0.2.1",
+  "publisher": "leslie",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onCommand:serialBridge.open",
+    "onView:serialBridge.mapping"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "serialBridge.open",
+        "title": "串口映射：打开映射面板",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "serialBridge.stop",
+        "title": "串口映射：停止全部通道"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "serialBridge",
+          "title": "串口映射",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "serialBridge": [
+        {
+          "type": "webview",
+          "id": "serialBridge.mapping",
+          "name": "本机 ↔ SSH 串口"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "串口映射",
+      "properties": {
+        "serialBridge.pythonPath": {
+          "type": "string",
+          "default": "~/.local/share/serialbridge/venv/bin/python3",
+          "scope": "machine",
+          "description": "本机 Python 解释器路径，串口需要 pySerial 3.5，CMSIS-DAP 需要 pyOCD 0.46.1。"
+        },
+        "serialBridge.remoteDirectory": {
+          "type": "string",
+          "default": "~/.local/share/serialbridge",
+          "scope": "machine",
+          "description": "远端运行文件与日志的专用目录，支持绝对路径或 ~/。新通道使用此目录；已有通道保留原目录，显式修改此设置后在下次手动启动时应用。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "package": "npx --yes @vscode/vsce package --no-dependencies"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MScorpioLee/vscode-serial-bridge.git"
+  }
+}
