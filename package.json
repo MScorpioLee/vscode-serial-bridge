@@ -2,7 +2,7 @@
   "name": "serial-bridge",
   "displayName": "串口与探针映射 · Mac ↔ SSH",
   "description": "多路本机串口与 CMSIS-DAP 探针，经 SSH 映射到远端工作区，独立控制并提供实时串口日志。",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "leslie",
   "license": "MIT",
   "engines": {

@@ -132,6 +132,59 @@ class LocalSerialTests(unittest.TestCase):
         self.command(child, {"type": "stop"})
         self.assertEqual(child.wait(timeout=3), 0)
 
+    def test_stop_cancels_pending_and_later_writes_in_the_same_stdin_batch(self):
+        # Keep the synthetic slave open so an erroneous UART write remains
+        # observable on the master even after the helper releases its own fd.
+        observer = os.open(self.path, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+        self.addCleanup(os.close, observer)
+        child = self.start()
+        self.ready(child)
+        messages = [
+            {"type": "write", "data": base64.b64encode(b"queued-before-stop").decode(), "id": "before"},
+            {"type": "stop"},
+            {"type": "write", "data": base64.b64encode(b"forbidden-after-stop").decode(), "id": "after"},
+        ]
+        batch = b"".join(json.dumps(message).encode() + b"\n" for message in messages)
+        # One atomic pipe write makes all three commands available to the same
+        # bounded stdin read before the bridge can service its UART write queue.
+        self.assertLessEqual(len(batch), os.fpathconf(child.stdin.fileno(), "PC_PIPE_BUF"))
+        self.assertEqual(os.write(child.stdin.fileno(), batch), len(batch))
+        self.assertEqual(child.wait(timeout=0.8), 0)
+        readable, _, _ = select.select([self.master], [], [], 0.1)
+        self.assertFalse(readable, "A queued or post-stop command reached the serial port")
+
+    def test_stop_releases_serial_without_waiting_for_a_backed_up_output_reader(self):
+        child = self.start()
+        self.ready(child)
+        # Leave protocol stdout unread, exactly as a stalled SSH/UI sink would.
+        # Only the synthetic PTY created in setUp is used; no USB device is opened.
+        accepted = 0
+        last_progress = time.monotonic()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                count = os.write(self.master, b"x" * 16384)
+            except BlockingIOError:
+                count = 0
+            if count:
+                accepted += count
+                last_progress = time.monotonic()
+            elif accepted > 2_000_000 and time.monotonic() - last_progress > 0.4:
+                break
+            if not count:
+                time.sleep(0.001)
+        self.assertGreater(accepted, 2_000_000, "Failed to produce protocol-output pressure")
+        self.command(child, {"type": "stop"})
+        try:
+            return_code = child.wait(timeout=0.8)
+        except subprocess.TimeoutExpired:
+            self.fail("Stop was blocked behind unread protocol output")
+        self.assertEqual(return_code, 0)
+        replacement = self.start()
+        self.ready(replacement)
+        self.command(replacement, {"type": "stop"})
+        self.assertEqual(replacement.wait(timeout=1), 0)
+
     @unittest.skipUnless(sys.platform == "darwin", "Darwin PTYs do not implement IOSSIOSPEED")
     def test_unsupported_custom_baud_keeps_reason_and_releases_lock(self):
         child = self.start(baud=123457)

@@ -10,6 +10,7 @@ const {Bridge,validateRemoteDirectory,DEFAULT_REMOTE_DIRECTORY,LEGACY_REMOTE_DIR
 const {ProbeBridge}=require('./probe');
 const {MappingManager}=require('./mappings');
 const {html}=require('./panel');
+const {DisplayQueue}=require('./display_queue');
 const {randomUUID}=require('node:crypto');
 const {token,channelFor,captureProbes,applyProbePresence}=require('./channel_identity');
 const DEFAULT={kind:'serial',device:'',host:'',name:'ttyBoard',baud:115200,dataBits:8,stopBits:1,parity:'none',flowControl:'none',probeUID:'',remotePort:5555};
@@ -52,15 +53,18 @@ function activate(context){
  const status=vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left,40);
  status.command='serialBridge.open';status.text='$(plug) 串口映射';status.tooltip='打开本机 ↔ SSH 通道管理';status.show();
  const snapshot=()=>({type:'snapshot',mappings:manager.list().map(item=>({...item,session:token(instance,manager.get(item.id))})),selectedId,devices,probes,hosts:hosts()});
- const post=m=>{for(const webview of views)webview.postMessage(m);};
+ const post=m=>Promise.allSettled(Array.from(views,webview=>Promise.resolve().then(()=>webview.postMessage(m))));
+ const display=new DisplayQueue(post);
  function update(){
   const list=manager.list(),connected=list.filter(x=>x.phase==='connected').length,starting=list.some(x=>x.phase==='starting');
   status.text=connected?`$(plug) ${connected} 路已连接`:starting?'$(sync~spin) 通道连接中':'$(plug) 串口映射';
-  status.tooltip=list.map(x=>`${x.config.kind==='probe'?'CMSIS-DAP':x.config.name}：${x.message}`).join('\n');post(snapshot());
+  status.tooltip=list.map(x=>`${x.config.kind==='probe'?'CMSIS-DAP':x.config.name}：${x.message}`).join('\n');
+  display.setSessions(new Map(list.filter(item=>item.phase==='connected').map(item=>[item.id,token(instance,manager.get(item.id))])));
+  void post(snapshot());
  }
  function persist(){void context.workspaceState.update('mappings',manager.persisted()).then(undefined,e=>output.appendLine('保存参数失败：'+e.message));void context.workspaceState.update('selectedId',selectedId);}
  manager.on('snapshot',update);
- manager.on('data',m=>post(m));
+ manager.on('data',m=>{if(views.size)display.enqueue({...m,session:token(instance,manager.get(m.id))});});
  async function refresh(){
   if(refreshing)return refreshing;
   refreshing=(async()=>{
@@ -130,7 +134,7 @@ function activate(context){
   if(!active.length||monitoring)return;monitoring=true;
   try{const result=await exec(python(),['-u',path.join(context.extensionPath,'helpers/list_probes.py')],{timeout:7000,maxBuffer:256*1024});const present=new Set(JSON.parse(result.stdout).map(p=>p.uid));applyProbePresence(manager,active,present);}catch(e){output.appendLine('探针在位检查失败：'+e.message);}finally{monitoring=false;}
  },3000);presenceTimer.unref?.();
- context.subscriptions.push({dispose(){clearInterval(presenceTimer);void manager.stopAll();}});
+ context.subscriptions.push({dispose(){clearInterval(presenceTimer);display.dispose();void manager.stopAll();}});
  persist();update();return {snapshot:()=>snapshot(),stop:()=>manager.stopAll()};
 }
 async function deactivate(){await activeManager?.stopAll();}

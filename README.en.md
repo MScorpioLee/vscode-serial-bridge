@@ -2,7 +2,9 @@
 
 Connect local serial devices and CMSIS-DAP probes on a Mac to a Linux SSH host from VS Code.
 
-Development version **0.2.1** · [中文](README.md) · [Source](https://github.com/MScorpioLee/vscode-serial-bridge)
+Development version **0.2.2** · [中文](README.md) · [Source](https://github.com/MScorpioLee/vscode-serial-bridge)
+
+0.2.2 fixes stopping a channel under heavy traffic: stop commands remain readable during backpressure, unsent writes are cancelled, and exited helper processes are reaped without waiting for inherited output pipes. Bounded, batched log previews keep the controls responsive.
 
 ## Features and scope
 
@@ -33,7 +35,7 @@ Use a VSIX from [GitHub Releases](https://github.com/MScorpioLee/vscode-serial-b
 In the VS Code Extensions menu, choose **Install from VSIX…**, or run:
 
 ```sh
-code --install-extension ./serial-bridge-0.2.1.vsix
+code --install-extension ./serial-bridge-0.2.2.vsix
 ```
 
 These instructions do not imply Marketplace availability.
@@ -70,6 +72,8 @@ Use the complete paths returned by the panel. A system-wide `/dev` alias is not 
 Use one consuming reader per PTY; competing readers can split the byte stream.
 Use log files for additional observers. Consumers should check the status file's connection state and heartbeat freshness.
 Remote logs rotate; the panel keeps at most 200,000 characters per channel and is not a complete capture archive.
+Under heavy load the panel may skip queued previews and show a notice; serial forwarding and remote logging use separate paths.
+Clicking stop immediately disables new sends and cancels queued bytes that have not been written to the device.
 
 ## CMSIS-DAP probe channels
 

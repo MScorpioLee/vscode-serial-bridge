@@ -129,6 +129,7 @@ class Bridge:
         self.running = True
         self.exit_code = 0
         self.drain_deadline = None
+        self.drain_output = False
         self.incoming = bytearray()
         self.pending = deque()
         self.pending_size = 0
@@ -140,9 +141,11 @@ class Bridge:
         self.output.append(memoryview(data))
         self.output_size += len(data)
 
-    def stop(self):
+    def stop(self, *, drain_output=False):
         self.running = False
-        self.drain_deadline = time.monotonic() + 2
+        self.drain_output = drain_output
+        if self.drain_deadline is None:
+            self.drain_deadline = time.monotonic() + 2
 
     def fail(self, error):
         if self.exit_code:
@@ -153,7 +156,7 @@ class Bridge:
             message += f"; {self.pending_size} queued bytes were not written"
         self.emit({"type": "error", "message": message})
         print(message, file=sys.stderr, flush=True)
-        self.stop()
+        self.stop(drain_output=True)
 
     def command(self, command):
         if not isinstance(command, dict):
@@ -237,13 +240,26 @@ class Bridge:
         self.emit({"type": "ready"})
         signal.signal(signal.SIGTERM, lambda *_: self.stop())
         signal.signal(signal.SIGINT, lambda *_: self.stop())
-        while self.running or self.output:
-            if not self.running and time.monotonic() > self.drain_deadline:
-                print("protocol output did not drain before shutdown", file=sys.stderr, flush=True)
-                return 1
-            # Pause ingress and UART writes when protocol output is backed up.
+        while True:
+            if not self.running:
+                # Clean queues here, rather than in a signal handler that could
+                # interrupt an in-progress queue write.
+                self.pending.clear()
+                self.pending_size = 0
+                if not self.drain_output:
+                    self.output.clear()
+                    self.output_size = 0
+                if not self.output:
+                    return self.exit_code
+                if time.monotonic() > self.drain_deadline:
+                    print("protocol output did not drain before shutdown", file=sys.stderr, flush=True)
+                    return 1
+            # Backpressure pauses UART traffic, but each loop must still read a
+            # bounded batch of commands so stop cannot be trapped behind output.
             capacity = self.output_size < MAX_OUTPUT - 4 * CHUNK
-            reads = [sys.stdin.fileno(), self.fd] if self.running and capacity else []
+            reads = [sys.stdin.fileno()] if self.running else []
+            if self.running and capacity:
+                reads.append(self.fd)
             writes = [sys.stdout.fileno()] if self.output else []
             if self.running and capacity and self.pending:
                 writes.append(self.fd)
@@ -265,7 +281,6 @@ class Bridge:
                     self.fail(error)
             except (ValueError, TypeError, OverflowError, RecursionError) as error:
                 self.fail(error)
-        return self.exit_code
 
 
 def main(argv=None):

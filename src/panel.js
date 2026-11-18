@@ -172,15 +172,16 @@ kbd { font:10px var(--vscode-font-family,system-ui); border:1px solid var(--vsco
   let mappings = [], devices = [], hosts = [], probes = [];
   let selectedId = null;
   const limit = 200000;
+  let logPaintPending = false;
   const logNode = document.createTextNode('');
   $('log').appendChild(logNode);
   const phases = {idle:'未连接',starting:'正在连接',connected:'已连接',stopping:'正在停止',error:'连接异常'};
 
-  function active(item) { return item && ['starting','connected','stopping'].includes(item.phase); }
+  function active(item) { return item && (item.cleanupPending || ['starting','connected','stopping'].includes(item.phase)); }
   function current() { return selectedId ? channels.get(selectedId) : null; }
   function createChannel(item) {
     const previous = saved.channels && saved.channels[item.id];
-    return { id:item.id, form:Object.assign({},defaults,item.config || {},previous && previous.form || {}), edited:Boolean(previous && previous.edited), send:Object.assign({text:'',hex:false,newline:'none'},previous && previous.send || {}), autoScroll:!previous || previous.autoScroll !== false, log:'', scroll:0, decoder:{rx:new TextDecoder('utf-8'),tx:new TextDecoder('utf-8')}, pending:false, snapshot:item };
+    return { id:item.id, form:Object.assign({},defaults,item.config || {},previous && previous.form || {}), edited:Boolean(previous && previous.edited), send:Object.assign({text:'',hex:false,newline:'none'},previous && previous.send || {}), autoScroll:!previous || previous.autoScroll !== false, log:'', scroll:0, decoder:{rx:new TextDecoder('utf-8'),tx:new TextDecoder('utf-8')}, pending:false, stopRequested:false, snapshot:item };
   }
   function post(command, extra) {
     const outgoing = Object.assign({command:command,mappingId:selectedId},extra || {});
@@ -262,9 +263,10 @@ kbd { font:10px var(--vscode-font-family,system-ui); border:1px solid var(--vsco
     const available = c && (probe ? probes.some(p => p.uid === c.form.probeUID) : devices.some(d => d.device === c.form.device));
     $('start').disabled = locked || !available || !c.form.host;
     $('start').textContent = c && (c.snapshot.phase === 'starting' || c.pending) ? '正在连接…' : (probe ? '建立探针通道' : '绑定并启动');
-    $('stop').disabled = !c || !locked;
+    $('stop').disabled = !c || !locked || c.stopRequested;
+    $('stop').textContent = c && (c.stopRequested || c.snapshot.phase === 'stopping') ? '正在停止…' : '停止映射';
     $('remove').disabled = !c || locked || mappings.length <= 1;
-    $('send').disabled = !c || probe || c.snapshot.phase !== 'connected' || !payload();
+    $('send').disabled = !c || probe || c.stopRequested || c.snapshot.phase !== 'connected' || !payload();
     $('newline').disabled = $('sendMode').value === 'hex';
     const remote = c && c.snapshot.remote;
     $('openLog').disabled = probe || !(remote && remote.log);
@@ -284,7 +286,19 @@ kbd { font:10px var(--vscode-font-family,system-ui); border:1px solid var(--vsco
   function appendLog(c,text) {
     if (!c || !text) return;
     c.log = (c.log + text).slice(-limit);
-    if (c.id === selectedId) { c.scroll = $('log').scrollTop; paintLog(c); }
+    if (c.id === selectedId && !logPaintPending) {
+      logPaintPending = true;
+      requestAnimationFrame(() => { logPaintPending = false; paintLog(current()); });
+    }
+  }
+  function appendFrame(incoming) {
+    const c = channels.get(incoming.id);
+    if(!c || c.form.kind === 'probe' || c.stopRequested || c.snapshot.phase !== 'connected' || incoming.session !== c.snapshot.session || !['rx','tx'].includes(incoming.type) || typeof incoming.data !== 'string') return;
+    try {
+      const bytes = Uint8Array.from(atob(incoming.data),char => char.charCodeAt(0));
+      const text = c.decoder[incoming.type].decode(bytes,{stream:true}).replace(/\u0000/g,'␀');
+      if(text) appendLog(c,'[' + new Date().toLocaleTimeString('zh-CN',{hour12:false}) + ' ' + incoming.type.toUpperCase() + '] ' + text + (text.endsWith('\n') ? '' : '\n'));
+    } catch(_) { appendLog(c,'[提示] 收到无法解码的数据帧\n'); }
   }
   function sendOptions() {
     const hex = $('sendMode').value === 'hex';
@@ -326,7 +340,7 @@ kbd { font:10px var(--vscode-font-family,system-ui); border:1px solid var(--vsco
   }
   function send() {
     const c = current();
-    if (!c || c.form.kind === 'probe' || c.snapshot.phase !== 'connected' || !payload()) return;
+    if (!c || c.form.kind === 'probe' || c.stopRequested || c.snapshot.phase !== 'connected' || !payload()) return;
     const hex = $('sendMode').value === 'hex';
     if (hex) {
       const compact = $('sendText').value.replace(/\s/g,'');
@@ -354,7 +368,7 @@ kbd { font:10px var(--vscode-font-family,system-ui); border:1px solid var(--vsco
     post('start',{config:Object.assign({},c.form)});
   });
   ['refresh','refreshAll'].forEach(id => $(id).addEventListener('click',() => { message('正在刷新串口设备与 CMSIS-DAP 探针…',false); post('refresh'); }));
-  $('stop').addEventListener('click',() => { post('stop'); message('正在停止当前通道…',false); });
+  $('stop').addEventListener('click',() => { const c = current(); if(!c || c.stopRequested) return; c.stopRequested = true; controls(); post('stop'); message('正在停止当前通道…',false); });
   $('openLog').addEventListener('click',() => post('openLog'));
   $('copyPort').addEventListener('click',() => post('copyPort'));
   $('clear').addEventListener('click',() => { const c = current(); if(c) { c.log = ''; paintLog(c); } });
@@ -378,7 +392,8 @@ kbd { font:10px var(--vscode-font-family,system-ui); border:1px solid var(--vsco
         if(isNew) channels.set(item.id,createChannel(item));
         const c = channels.get(item.id), old = c.snapshot;
         if(active(item) || !c.edited) c.form = Object.assign({},defaults,item.config || {});
-        if(item.phase === 'connected' && old.phase !== 'connected') c.decoder = {rx:new TextDecoder('utf-8'),tx:new TextDecoder('utf-8')};
+        if(item.session !== old.session || (item.phase === 'connected' && old.phase !== 'connected')) c.decoder = {rx:new TextDecoder('utf-8'),tx:new TextDecoder('utf-8')};
+        if(!active(item)) c.stopRequested = false;
         c.pending = false;
         c.snapshot = item;
         if(c.form.kind === 'probe' && (isNew || old.phase !== item.phase || old.message !== item.message)) appendLog(c,'[状态] ' + (item.message || phases[item.phase] || '') + '\n');
@@ -387,16 +402,17 @@ kbd { font:10px var(--vscode-font-family,system-ui); border:1px solid var(--vsco
       const changed = wanted !== selectedId;
       selectedId = wanted || null;
       render(changed); save();
-    } else if((incoming.type === 'rx' || incoming.type === 'tx') && typeof incoming.data === 'string') {
-      const c = channels.get(incoming.id); if(!c || c.form.kind === 'probe') return;
-      try {
-        const bytes = Uint8Array.from(atob(incoming.data),char => char.charCodeAt(0));
-        const text = c.decoder[incoming.type].decode(bytes,{stream:true}).replace(/\u0000/g,'␀');
-        if(text) appendLog(c,'[' + new Date().toLocaleTimeString('zh-CN',{hour12:false}) + ' ' + incoming.type.toUpperCase() + '] ' + text + (text.endsWith('\n') ? '' : '\n'));
-      } catch(_) { appendLog(c,'[提示] 收到无法解码的数据帧\n'); }
+    } else if(incoming.type === 'dataBatch' && Array.isArray(incoming.frames)) {
+      if(Array.isArray(incoming.dropped)) incoming.dropped.forEach(item => {
+        const c = channels.get(item.id);
+        if(!c || item.session !== c.snapshot.session || c.stopRequested || c.snapshot.phase !== 'connected') return;
+        c.decoder = {rx:new TextDecoder('utf-8'),tx:new TextDecoder('utf-8')};
+        appendLog(c,'[提示] 日志预览繁忙，已略过部分显示；完整数据请查看远端日志。\n');
+      });
+      incoming.frames.forEach(appendFrame);
     } else if(incoming.type === 'notice' && typeof incoming.message === 'string') {
       const c = channels.get(incoming.mappingId || incoming.id || selectedId);
-      if(c) { c.pending = false; appendLog(c,'[提示] ' + incoming.message + '\n'); }
+      if(c) { c.pending = false; c.stopRequested = false; appendLog(c,'[提示] ' + incoming.message + '\n'); }
       if(!c || c.id === selectedId) { controls(); message(incoming.message,true); }
     }
   });

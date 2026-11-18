@@ -37,12 +37,13 @@ class JsonWriter{
  constructor(stream,onError){this.stream=stream;this.onError=onError;this.pending=0;this.closed=false;stream.on('error',e=>{if(!this.closed)onError(e);});}
  send(obj){if(this.closed)throw Error('映射已关闭');const line=Buffer.from(JSON.stringify(obj)+'\n');if(this.pending+line.length>MAX_QUEUE)throw Error('映射接收方过慢，已停止以避免数据错乱');this.pending+=line.length;this.stream.write(line,e=>{this.pending-=line.length;if(e&&!this.closed)this.onError(e);});}
  end(){this.closed=true;this.stream.end();}
+ abort(){this.closed=true;this.stream.destroy();}
 }
 const quote=s=>"'"+String(s).replace(/'/g,"'\\''")+"'";
 function remoteCommand(source,c){const code=`import base64;exec(compile(base64.b64decode('${Buffer.from(source).toString('base64')}'),'serialbridge_remote.py','exec'))`;return ['python3','-u','-c',code,'--directory',validateRemoteDirectory(c.remoteDirectory),'--name',c.name,'--baud',String(c.baud),'--dev-alias'].map(quote).join(' ');}
 class Bridge extends EventEmitter{
  constructor({root,python,spawn=cp.spawn,remoteSource}={}){super();this.root=root;this.python=python;this.spawn=spawn;this.remoteSource=remoteSource;this.phase='idle';this.message='尚未绑定';this.rxBytes=0;this.txBytes=0;this.children=[];this.generation=0;this.request=0;}
- snapshot(){return {phase:this.phase,message:this.message,rxBytes:this.rxBytes,txBytes:this.txBytes,remote:this.remote,config:this.config};}
+ snapshot(){return {phase:this.phase,message:this.message,rxBytes:this.rxBytes,txBytes:this.txBytes,remote:this.remote,config:this.config,cleanupPending:Boolean(this.children.length)};}
  update(){this.emit('snapshot',this.snapshot());}
  async start(input){
   if(this.phase==='connected'||this.phase==='starting')throw Error('映射已启动');
@@ -62,16 +63,25 @@ class Bridge extends EventEmitter{
  }
  launch(exe,args,label,onLine,gen,{text=false}={}){
   const child=this.spawn(exe,args,{stdio:['pipe','pipe','pipe'],shell:false});
+  // A descendant can keep stdout/stderr open after this process has exited.
+  // Process exit is the ownership boundary; stdio 'close' is not.
+  child.bridgeExited=false;
+  child.bridgeExit=new Promise(resolve=>{
+   const exited=()=>{child.bridgeExited=true;resolve();};
+   child.once('exit',exited);child.once('close',exited);
+   child.on('error',()=>{if(child.pid===undefined)exited();});
+  });
   child.bridgeClosed=false;child.bridgeClose=new Promise(resolve=>child.once('close',()=>{child.bridgeClosed=true;resolve();}));
   this.children.push(child);let stderr='';
   child.writer=new JsonWriter(child.stdin,e=>this.fail(`${label}：${e.message}`,gen));
   const dispatch=msg=>{if(gen===this.generation)onLine(msg);};
   const reader=new LineReader(dispatch,MAX_LINE,text?(s=>s):JSON.parse);
   const errorReader=text?new LineReader(dispatch,MAX_LINE,s=>s):undefined;
-  child.stdout.on('data',x=>{try{reader.push(x);}catch(e){this.fail(`${label}：${e.message}`,gen);}});
-  child.stderr.on('data',x=>{stderr=(stderr+x.toString()).slice(-2000);if(errorReader){try{errorReader.push(x);}catch(e){this.fail(`${label}：${e.message}`,gen);}}});
+  child.stdout.on('data',x=>{if(gen!==this.generation)return;try{reader.push(x);}catch(e){this.fail(`${label}：${e.message}`,gen);}});
+  child.stderr.on('data',x=>{if(gen!==this.generation)return;stderr=(stderr+x.toString()).slice(-2000);if(errorReader){try{errorReader.push(x);}catch(e){this.fail(`${label}：${e.message}`,gen);}}});
   child.on('error',e=>this.fail(`${label}：${e.message}`,gen));
-  child.on('close',(code,signal)=>{if(gen===this.generation&&['connected','starting'].includes(this.phase))this.fail(`${label}连接已结束${stderr.trim()?'：'+stderr.trim():` (${signal||code})`}`,gen);});return child;
+  const ended=(code,signal)=>{if(gen===this.generation&&['connected','starting'].includes(this.phase))this.fail(`${label}连接已结束${stderr.trim()?'：'+stderr.trim():` (${signal||code})`}`,gen);};
+  child.on('exit',ended);child.on('close',ended);return child;
  }
  onRemote(msg,gen){
   if(msg.type==='error'){this.fail(msg.message||'远端映射失败',gen);return;}
@@ -102,15 +112,43 @@ class Bridge extends EventEmitter{
  }
  sendHeartbeat(){if(this.phase!=='connected')return;const now=Date.now(),id=`${this.generation}-${++this.heartbeatSeq}`;this.heartbeats.set(id,now);for(const [key,time] of this.heartbeats)if(now-time>5000)this.heartbeats.delete(key);this.remoteWriter.send({type:'heartbeat',id});}
  send(text,hex,newline){if(this.phase!=='connected')throw Error('请先启动映射');const data=encodeSend(text,hex,newline);this.localWriter.send({type:'write',data:data.toString('base64'),id:'ui-'+Date.now()});}
- fail(message,gen=this.generation){if(gen!==this.generation)return;const reject=this.rejectStart;this.rejectStart=undefined;this.resolveStart=undefined;this.phase='error';this.message=String(message).slice(0,3000);clearTimeout(this.startTimer);this.update();reject?.(Error(this.message));void this.closeChildren();}
+ fail(message,gen=this.generation){if(gen!==this.generation)return;const reject=this.rejectStart;this.rejectStart=undefined;this.resolveStart=undefined;this.phase='error';this.message=String(message).slice(0,3000);clearTimeout(this.startTimer);this.update();reject?.(Error(this.message));void this.closeChildren().catch(()=>{});}
+ async closeChild(child){
+  const exited=()=>child.bridgeExited||(child.exitCode!==null&&child.exitCode!==undefined)||(child.signalCode!==null&&child.signalCode!==undefined);
+  if(!exited()){
+   try{
+    // Stopping must discard queued writes, not deliver a backlog before 'stop'.
+    if(child.writer.pending)child.writer.abort();
+    else {child.writer.send({type:'state',connected:false,baud:this.config?.baud});child.writer.send({type:'stop'});child.writer.end();}
+   }catch{child.writer.abort();}
+   let term,force,deadline;
+   try{
+    await Promise.race([child.bridgeExit,new Promise((_,reject)=>{
+     const kill=signal=>{try{child.kill(signal);}catch{}};
+     term=setTimeout(()=>kill('SIGTERM'),800);
+     force=setTimeout(()=>kill('SIGKILL'),2800);
+     deadline=setTimeout(()=>reject(Error('无法确认映射进程已退出，设备仍保留占用；请重试停止')),4000);
+    })]);
+   }finally{clearTimeout(term);clearTimeout(force);clearTimeout(deadline);}
+  }
+  // Once exit is confirmed, destroy our pipe ends rather than waiting for a
+  // descendant to close inherited descriptors. This also drops remaining I/O.
+  child.writer.abort();child.stdout.destroy();child.stderr.destroy();
+ }
  async closeChildren(){
   ++this.generation;clearInterval(this.heartbeatTimer);this.heartbeatTimer=undefined;clearTimeout(this.startTimer);clearTimeout(this.updateTimer);this.updateTimer=undefined;
   if(this.closing)return this.closing;
-  const children=this.children.splice(0);this.localChild=undefined;this.remoteChild=undefined;
-  for(const child of children){try{child.writer.send({type:'state',connected:false,baud:this.config?.baud});child.writer.send({type:'stop'});child.writer.end();}catch{}}
-  this.closing=Promise.all(children.map(async child=>{if(child.bridgeClosed)return;const term=setTimeout(()=>child.kill('SIGTERM'),800);const force=setTimeout(()=>child.kill('SIGKILL'),2800);await child.bridgeClose;clearTimeout(term);clearTimeout(force);}));
-  await this.closing;this.closing=undefined;this.localWriter=undefined;this.remoteWriter=undefined;
+  const children=[...this.children];this.localChild=undefined;this.remoteChild=undefined;this.localWriter=undefined;this.remoteWriter=undefined;
+  // Install the shared task before stream callbacks can re-enter cleanup.
+  const closing=Promise.resolve().then(async()=>{
+   const results=await Promise.allSettled(children.map(child=>this.closeChild(child)));
+   for(let i=0;i<children.length;i++)if(results[i].status==='fulfilled')this.children=this.children.filter(child=>child!==children[i]);
+   const failed=results.find(result=>result.status==='rejected');if(failed)throw failed.reason;
+  }).catch(error=>{
+   this.phase='error';this.message=error.message;this.update();throw error;
+  }).finally(()=>{if(this.closing===closing)this.closing=undefined;});
+  this.closing=closing;return closing;
  }
- async stop(notify=true){const request=++this.request;const reject=this.rejectStart;this.rejectStart=undefined;this.resolveStart=undefined;reject?.(Error('映射已停止'));await this.closeChildren();if(notify&&request===this.request){this.phase='idle';this.message='映射已停止';this.update();}}
+ async stop(notify=true){const request=++this.request;const reject=this.rejectStart;this.rejectStart=undefined;this.resolveStart=undefined;this.phase='stopping';this.message='正在停止映射…';if(notify)this.update();reject?.(Error('映射已停止'));await this.closeChildren();if(request===this.request){this.phase='idle';this.message='映射已停止';if(notify)this.update();}}
 }
 module.exports={Bridge,LineReader,JsonWriter,validateConfig,encodeSend,remoteCommand,decodeData,validateRemoteDirectory,DEFAULT_REMOTE_DIRECTORY,LEGACY_REMOTE_DIRECTORY};

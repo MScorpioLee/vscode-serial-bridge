@@ -2,7 +2,9 @@
 
 在 Mac 的 VS Code 中，把本机串口或 CMSIS-DAP 探针分别连接到 Linux SSH 主机。
 
-研发版本 **0.2.1** · [English](README.en.md) · [源代码](https://github.com/MScorpioLee/vscode-serial-bridge)
+研发版本 **0.2.2** · [English](README.en.md) · [源代码](https://github.com/MScorpioLee/vscode-serial-bridge)
+
+0.2.2 修复频繁收发时停止映射可能卡住的问题：拥塞时仍处理停止指令，停止时取消尚未发送的数据，并正确回收已退出的辅助进程。日志预览合并刷新并限制积压，避免大量日志影响按钮响应。
 
 ## 能做什么
 
@@ -37,7 +39,7 @@ python3 -m venv ~/.local/share/serialbridge/venv
 在 VS Code 扩展面板菜单中选择 **Install from VSIX…**，或运行：
 
 ```sh
-code --install-extension ./serial-bridge-0.2.1.vsix
+code --install-extension ./serial-bridge-0.2.2.vsix
 ```
 
 此说明使用 VSIX 安装流程，不代表扩展已经上架 Marketplace。
@@ -77,6 +79,8 @@ ssh -o BatchMode=yes ssh-target python3 --version
 同一个 PTY 应由一个消费程序读取；多个程序同时读取可能分走数据。
 需要多个观察者时使用日志文件。消费程序应检查状态文件中的连接状态和心跳时间。
 日志有大小限制并轮转；面板仅缓存每通道最近 200,000 个字符，不适合作为完整采集存档。
+高负载时面板会略过积压的预览并显示提示；这不改变串口转发和远端日志记录。
+点击停止后立即禁止新发送，尚未写入设备的排队数据会被取消。
 
 ## 使用 CMSIS-DAP
 
